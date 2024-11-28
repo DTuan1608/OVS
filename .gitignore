@@ -1,0 +1,8 @@
+*.o
+*.log
+*.tmp
+*.bak
+*.swp
+*.sock
+*.pid
+*.tar.gz
