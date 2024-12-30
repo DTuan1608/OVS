@@ -404,4 +404,67 @@ bool ofproto_dpif_ct_zone_timeout_policy_get_name(
 
 bool ovs_explicit_drop_action_supported(struct ofproto_dpif *);
 
+/** 
+ * Modified code 
+*/
+
+#define COOKIEBITS 24	/* Upper bits store count */
+#define COOKIEMASK (((uint32_t)1 << COOKIEBITS) - 1)
+
+#define MAX_SYNCOOKIE_AGE (60*2) // 2 phut
+#define MAX_SIZE_wHITE_LIST (1000000)
+
+#define CLIENT true
+#define SERVER false
+
+static uint32_t syncookie_secret[2] = {1234,2345}; //key bi mat
+// struct timeval tstop, tstart;
+
+struct address {
+    uint32_t ip;
+    uint16_t tcp;
+};
+
+struct translatedSeq {
+    bool translated;
+    int delta; // delta = server's seqNum - cookie 
+};
+
+
+struct real_connect
+{
+    struct address client, server;
+    uint32_t cookie;
+    struct translatedSeq translate_status;
+};
+
+struct wlist_check_ret {
+    int idx;
+    bool direct;
+};
+
+//white list
+struct whitelist
+{
+    struct real_connect arr[MAX_SIZE_wHITE_LIST];
+    uint16_t current_number_element; // 
+};
+
+void  swap(void  *v1, void  *v2, size_t  size);
+struct flow create_syn_ack_flow(struct dp_packet packet_in);
+struct flow create_flow(struct dp_packet packet_in,uint flags,bool reverse);
+struct dp_packet* packet_compose(struct dp_packet packet_in,int flags_in,bool second_syn_ack,uint32_t cookie);
+
+uint32_t cookie_hash(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport,
+               uint32_t count, uint32_t c);
+
+uint32_t secure_tcp_syn_cookie(uint32_t saddr, uint32_t daddr, uint16_t sport,
+                   uint16_t dport, uint32_t sseq, uint32_t data);
+
+uint32_t check_tcp_syn_cookie(uint32_t cookie, uint32_t saddr, uint32_t daddr,
+                  uint16_t sport, uint16_t dport, uint32_t sseq);
+struct wlist_check_ret check_white_list(uint32_t src_ip, uint16_t src_tcp, uint32_t dst_ip, uint16_t dst_tcp);
+struct dp_packet translate_seq_number (struct dp_packet packet_in, struct wlist_check_ret wcr);
+/*End modified code*/
+
 #endif /* ofproto-dpif.h */
