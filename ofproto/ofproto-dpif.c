@@ -73,10 +73,348 @@
 #include "uuid.h"
 #include "vlan-bitmap.h"
 
+#include "csum.h"
+#include "openvswitch/ofp-packet.h"
+#include <flow.h>
+#include <sys/time.h>
+
 VLOG_DEFINE_THIS_MODULE(ofproto_dpif);
 
 COVERAGE_DEFINE(ofproto_dpif_expired);
 COVERAGE_DEFINE(packet_in_overflow);
+
+/**
+ * Global value
+ */
+
+static struct whitelist wlist = {.current_number_element = 0};
+/*Ket thuc global value*/
+
+
+/**
+ * Declare static funtions
+ */
+
+static void flow_compose_l4_csum(struct dp_packet *p, const struct flow *flow,
+                uint32_t pseudo_hdr_csum);
+ /*Ket thuc declare static funtion*/
+
+
+/**
+ * - Trien khai syn cookie
+ * - Dung hash function co san trong "hash.h" 
+*/
+
+// tao syn cookie
+uint32_t cookie_hash(uint32_t saddr, uint32_t daddr, uint16_t sport, uint16_t dport,
+               uint32_t count, uint32_t c)
+{
+    uint32_t hash_data[4] __attribute__((aligned (4))); // [ip_src, ip_dst, sport+dport, count] 
+    hash_data[0] = (saddr);
+    hash_data[1] = (daddr);
+    hash_data[2] = (sport << 16) | (dport);
+    hash_data[3] = count;
+
+    uint32_t *phash_data = hash_data;
+    
+    return hash_words(phash_data,4,syncookie_secret[c]);
+}
+
+// tao sequence number
+uint32_t secure_tcp_syn_cookie(uint32_t saddr, uint32_t daddr, uint16_t sport,
+                   uint16_t dport, uint32_t sseq, uint32_t data)
+{
+    uint32_t count = time_msec() / 1000 ; // lay dau thoi gian hien tai theo giay
+    return (cookie_hash(saddr, daddr, sport, dport, 0, 0) + sseq + 
+                (count << COOKIEBITS) + ((cookie_hash(saddr, daddr, sport, dport, count, 1) + data) & COOKIEMASK));
+}
+
+// check syn cookie, return syncookie_secret[1] neu cookie chinh xac
+uint32_t check_tcp_syn_cookie(uint32_t cookie, uint32_t saddr, uint32_t daddr,
+                  uint16_t sport, uint16_t dport, uint32_t sseq)
+{
+    uint32_t diff, count = time_msec() / 1000; 
+
+    /* Strip away the layers from the cookie */
+    cookie -= cookie_hash(saddr, daddr, sport, dport, 0, 0) + sseq;
+
+    /* Cookie is now reduced to (count * 2^24) ^ (hash % 2^24) */
+    diff = (count - (cookie >> COOKIEBITS)) & ((uint32_t) -1 >> COOKIEBITS);
+
+    if (diff >= MAX_SYNCOOKIE_AGE)
+        return -1; // error
+
+    return (cookie -
+        cookie_hash(saddr, daddr, sport, dport, count - diff, 1))
+        & COOKIEMASK;	/* return 1234 if cookie is validate */
+};
+/*Ket thuc trien khai syncookie*/
+
+/**
+ * Cac ham chuc nang
+ */
+
+//swap 2 values
+void  swap(void  *v1, void  *v2, size_t  size)  {
+    void *temp = malloc(size);
+    memcpy(temp, v1, size);
+    memcpy(v1, v2, size);
+    memcpy(v2, temp, size);
+    free(temp);
+}
+
+// Calculate tcp check sum
+static void
+flow_compose_l4_csum(struct dp_packet *p, const struct flow *flow,
+                     uint32_t pseudo_hdr_csum)
+{
+    size_t l4_len = (char *) dp_packet_tail(p) - (char *) dp_packet_l4(p);
+
+    if (!(flow->nw_frag & FLOW_NW_FRAG_ANY)
+        || !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
+        if (flow->nw_proto == IPPROTO_TCP) {
+            struct tcp_header *tcp = dp_packet_l4(p);
+
+            tcp->tcp_csum = 0;
+            tcp->tcp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
+                                                      tcp, l4_len));
+        } else if (flow->nw_proto == IPPROTO_UDP) {
+            struct udp_header *udp = dp_packet_l4(p);
+
+            udp->udp_csum = 0;
+            udp->udp_csum = csum_finish(csum_continue(pseudo_hdr_csum,
+                                                      udp, l4_len));
+            if (!udp->udp_csum) {
+                udp->udp_csum = htons(0xffff);
+            }
+        } else if (flow->nw_proto == IPPROTO_ICMP) {
+            struct icmp_header *icmp = dp_packet_l4(p);
+
+            icmp->icmp_csum = 0;
+            icmp->icmp_csum = csum(icmp, l4_len);
+        } else if (flow->nw_proto == IPPROTO_IGMP) {
+            struct igmp_header *igmp = dp_packet_l4(p);
+
+            igmp->igmp_csum = 0;
+            igmp->igmp_csum = csum(igmp, l4_len);
+        } else if (flow->nw_proto == IPPROTO_ICMPV6) {
+            struct icmp6_data_header *icmp6 = dp_packet_l4(p);
+
+            icmp6->icmp6_base.icmp6_cksum = 0;
+            icmp6->icmp6_base.icmp6_cksum =
+                csum_finish(csum_continue(pseudo_hdr_csum, icmp6, l4_len));
+        }
+    }
+}
+
+// return real_client's index neu tim thay, nguoc lai tra ve -1
+struct wlist_check_ret check_white_list(uint32_t src_ip, uint16_t src_tcp, uint32_t dst_ip, uint16_t dst_tcp)
+{
+    struct wlist_check_ret ret = {.direct = CLIENT, .idx = -1};
+    for(int i = 0; i <  wlist.current_number_element; i++)
+        {
+            // FILE *log = fopen("/home/fil02/Desktop/avant-guard-log/log_file.txt", "a");
+            // fprintf(log,"check wlist : src_ip-%u, src_tcp-%u, dst_ip-%u, dst_tcp-%u\n\n",wlist.arr[i].client.ip,wlist.arr[i].client.tcp,wlist.arr[i].server.ip,wlist.arr[i].server.tcp);
+            // fclose(log);
+            if ( ((wlist.arr[i].client.ip == src_ip) && (wlist.arr[i].client.tcp == src_tcp) &&  (wlist.arr[i].server.ip == dst_ip) && (wlist.arr[i].server.tcp == dst_tcp))) 
+            {
+                ret.idx = i;
+                goto out;
+            } 
+            else if (((wlist.arr[i].client.ip == dst_ip) && (wlist.arr[i].client.tcp == dst_tcp) &&  (wlist.arr[i].server.ip == src_ip) && (wlist.arr[i].server.tcp == src_tcp)))
+            {
+                ret.idx = i;
+                ret.direct = SERVER;
+                goto out;
+            }
+        }
+out:
+    return ret; // khong tim thay trong white list
+}
+
+struct dp_packet translate_seq_number (struct dp_packet packet_in, struct wlist_check_ret wcr) 
+{
+    struct ip_header *ip_in = dp_packet_l3(&packet_in);
+    struct dp_packet translated_packet = packet_in;
+    struct tcp_header *tcp = dp_packet_l4(&translated_packet);
+    struct ip_header *ip = dp_packet_l3(&translated_packet);
+    int delta = wlist.arr[wcr.idx].translate_status.delta;
+
+    // doi seq number va ack seq number 
+    if (wcr.direct == CLIENT) { 
+        put_16aligned_be32(&(tcp->tcp_ack),htonl(ntohl(get_16aligned_be32(&tcp->tcp_ack)) + delta));
+    }
+    else {
+        put_16aligned_be32(&(tcp->tcp_seq),htonl(ntohl(get_16aligned_be32(&tcp->tcp_seq)) - delta));
+    }
+
+    // tinh lai checksum
+    tcp->tcp_csum = 0;
+    ip->ip_csum = 0;
+
+    size_t l4_len = (char *) dp_packet_tail(&translated_packet) - (char *) dp_packet_l4(&translated_packet);
+    ip->ip_tot_len = ip_in->ip_tot_len;
+    ip->ip_csum = csum(ip, sizeof *ip);
+
+    uint32_t pseudo_hdr_csum = packet_csum_pseudoheader(ip);
+    tcp->tcp_csum = csum_finish(csum_continue(pseudo_hdr_csum, tcp, l4_len));
+    return translated_packet;
+} 
+/*Ket thuc cac ham chuc nang*/
+
+/**
+ * Create modified flow and packets
+ */
+
+// If reverse is true, swap packet_in's src and dst address. 
+struct flow create_flow(struct dp_packet packet_in,uint flags,bool reverse) {
+
+    //tach flow
+    struct flow new_flow ;
+    flow_extract(&packet_in,&new_flow);
+
+    // dao nguoc src/dst
+    if ( reverse == true) {
+        swap(&(new_flow.tp_src),&(new_flow.tp_dst),sizeof(ovs_be16));
+        swap(&(new_flow.nw_src),&(new_flow.nw_dst),sizeof(ovs_be32));
+        swap(&(new_flow.dl_src),&(new_flow.dl_dst),sizeof(struct eth_addr));
+    }
+    new_flow.tcp_flags = htons(flags); // co syn/ack
+
+    return new_flow;
+}
+
+
+// create sent packet with packet_in and flags_in
+struct dp_packet* packet_compose(struct dp_packet packet_in, int flags_in, bool second_syn_ack, uint32_t cookie) {
+
+    uint32_t pseudo_hdr_csum;
+    
+    struct flow new_flow;
+
+    struct dp_packet *packet = dp_packet_new(sizeof(struct dp_packet));
+
+    struct tcp_header *tcp_in = dp_packet_l4(&packet_in);
+    unsigned char *tcp_option_in;
+    unsigned char tcp_option_in1[8] = {0x02,0x04,0x0B,0xb8,0x04,0x02,0x00,0x00};
+    unsigned char tcp_option_in2[8] = {0x02,0x04,0x05,0xb4,0x04,0x02,0x00,0x00};
+    int tcp_heder_len = 0;
+
+    // FILE *log = fopen("/home/aothatday1/Desktop/log_file.txt", "a");
+    // fprintf(log,"tcp-option:%d,%d\n",tcp_option_in[0],tcp_option_in[4]);
+    // fclose(log);
+
+    uint32_t seq_in = ntohl(get_16aligned_be32(&tcp_in->tcp_seq));
+    uint32_t ack_in = ntohl(get_16aligned_be32(&tcp_in->tcp_ack));
+
+    uint32_t seq, ack;
+    uint16_t winsz;
+
+    // Không chứa SYN hoặc ACK
+    if (ntohs(flags_in) & ~(TCP_SYN|TCP_ACK))
+    {
+        return packet;
+    }
+
+    if (ntohs(flags_in) == TCP_SYN) 
+    {
+        new_flow = create_flow(packet_in, TCP_SYN|TCP_ACK, true); // packet_in = syn => gui lai goi syn/ack cho client
+
+        seq = secure_tcp_syn_cookie(ntohl(new_flow.nw_dst), ntohl(new_flow.nw_src)
+                                                    ,ntohs(new_flow.tp_dst),ntohs(new_flow.tp_src),seq_in,syncookie_secret[1]);
+        ack = seq_in+1;
+        tcp_heder_len = 7;
+        tcp_option_in = tcp_option_in1;
+        winsz = 0;
+        goto build_hdr;
+    } 
+    
+    if (ntohs(flags_in) == TCP_ACK) 
+    {
+        new_flow = create_flow(packet_in, TCP_SYN,false); // packet_in = ack => gui goi syn cho server
+
+        seq = seq_in - 1;
+        ack = 0;
+        tcp_heder_len = 7;
+        tcp_option_in = tcp_option_in2;
+        winsz = 43440;
+        goto build_hdr;
+    } 
+    
+    if (ntohs(flags_in) == (TCP_SYN|TCP_ACK)) 
+    {
+        if (second_syn_ack == false) {
+            new_flow = create_flow(packet_in,TCP_ACK,true); // packet_in = syn/ack => goi lai goi ack cho server
+
+            // seq = ack_in - 1;
+            seq = ack_in;
+            ack = seq_in + 1;
+            tcp_heder_len = 5;
+            winsz = 43440;
+            goto build_hdr;
+        } 
+
+        new_flow = create_flow(packet_in,TCP_ACK|TCP_SYN,false); 
+        tcp_option_in = tcp_option_in1;
+        seq = cookie;
+        ack = seq_in ;
+        tcp_heder_len = 7;
+        winsz = 43440;
+        goto build_hdr;
+    } 
+
+build_hdr:
+    // fill eth header
+    eth_compose(packet, new_flow.dl_dst, new_flow.dl_src, ntohs(new_flow.dl_type), 0);
+    if (new_flow.dl_type == htons(FLOW_DL_TYPE_NONE)) {
+        struct eth_header *eth = dp_packet_eth(packet);
+        eth->eth_type = htons(dp_packet_size(packet));
+    }
+    // fill ip header
+    struct ip_header *ip;
+
+    ip = dp_packet_put_zeros(packet, sizeof *ip);
+    ip->ip_ihl_ver = IP_IHL_VER(5, 4);
+    ip->ip_tos = 0x01;
+    ip->ip_ttl = new_flow.nw_ttl;
+    ip->ip_proto = new_flow.nw_proto;
+    put_16aligned_be32(&ip->ip_src, new_flow.nw_src);
+    put_16aligned_be32(&ip->ip_dst, new_flow.nw_dst);
+
+    if (new_flow.nw_frag & FLOW_NW_FRAG_ANY) {
+        ip->ip_frag_off |= htons(IP_MORE_FRAGMENTS);
+        if (new_flow.nw_frag & FLOW_NW_FRAG_LATER) {
+            ip->ip_frag_off |= htons(100);
+        }
+    }
+
+    dp_packet_set_l4(packet, dp_packet_tail(packet));
+
+    // fill tcp header
+    struct tcp_header *tcp = dp_packet_put_zeros(packet, 20);
+    tcp->tcp_src = new_flow.tp_src;
+    tcp->tcp_dst = new_flow.tp_dst;
+    tcp->tcp_ctl = TCP_CTL(ntohs(new_flow.tcp_flags), tcp_heder_len);
+    tcp->tcp_csum = 0;             
+    tcp->tcp_urg = 0;
+    tcp->tcp_winsz = htons(winsz);
+    put_16aligned_be32(&(tcp->tcp_ack),htonl(ack));
+    put_16aligned_be32(&(tcp->tcp_seq),htonl(seq));
+    unsigned char* tcp_option = dp_packet_put_zeros(packet, tcp_heder_len*4-20);
+    memcpy(tcp_option,tcp_option_in,tcp_heder_len*4-20);
+
+    //tinh check sum
+    ip = dp_packet_l3(packet);
+    ip->ip_tot_len = htons(packet->l4_ofs - packet->l3_ofs + tcp_heder_len*4);
+    /* Checksum has already been zeroed by put_zeros call. */
+    ip->ip_csum = csum(ip, sizeof *ip);
+
+    pseudo_hdr_csum = packet_csum_pseudoheader(ip);
+    flow_compose_l4_csum(packet, &new_flow, pseudo_hdr_csum);
+    
+    return packet;
+}
+/*End create modified packet*/
 
 struct flow_miss;
 
@@ -1848,8 +2186,6 @@ destruct(struct ofproto *ofproto_, bool del)
 
     seq_destroy(ofproto->ams_seq);
 
-    /* Wait for all the meter destroy work to finish. */
-    ovsrcu_barrier();
     close_dpif_backer(ofproto->backer, del);
 }
 
@@ -1880,12 +2216,219 @@ run(struct ofproto *ofproto_)
         struct ofproto_async_msg *am;
         struct ovs_list ams;
 
+        // struct dp_packet* tpacket;
+       
         guarded_list_pop_all(&ofproto->ams, &ams);
         LIST_FOR_EACH_POP (am, list_node, &ams) {
+            struct flow tflow;
+            struct dp_packet* buffer = dp_packet_new(0);
+
+            dp_packet_use_const(buffer, am->pin.up.base.packet, am->pin.up.base.packet_len);
+            
+            flow_extract(buffer, &tflow);
+            if (tflow.nw_proto != 6) {
+                goto normal_handle;
+            }
+
+            if (ntohs(tflow.tcp_flags) == TCP_SYN) 
+            {
+                // struct ofpbuf ofpacts; 
+                // struct flow new_flow;
+                // struct dp_packet* npacket;
+                // //                 FILE *log = fopen("/home/security/AVANT.txt", "a");
+                // // fprintf(log, "Nhay vao syn %x\n", tflow.nw_proto);
+                // // fclose(log);
+
+                // ofpbuf_init(&ofpacts, sizeof(struct ofpact_output));
+                // ofpact_put_OUTPUT(&ofpacts)->port = am->pin.up.base.flow_metadata.flow.in_port.odp_port; // gửi ngược lại in_port
+
+                // npacket = packet_compose(*buffer,tflow.tcp_flags,true,0);
+                // flow_extract(npacket,&new_flow);
+                // new_flow.in_port.ofp_port = OFPP_NONE;
+                
+                // ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow,NULL,ofpacts.data,ofpacts.size,npacket);
+                // dp_packet_delete(npacket);
+                // ofpbuf_uninit(&ofpacts);
+                goto free_packet;
+            } 
+
+            if (ntohs(tflow.tcp_flags) == TCP_ACK) 
+            {                                  
+                struct wlist_check_ret wlist_check = check_white_list(tflow.nw_src,tflow.tp_src,tflow.nw_dst,tflow.tp_dst);
+                if (wlist_check.idx != -1 && wlist.arr[wlist_check.idx].translate_status.translated == true) {
+                    struct ofpbuf ofpacts; // buffer
+                    struct flow new_flow;
+                    struct dp_packet packet;
+
+                    ofpbuf_init(&ofpacts, sizeof(struct ofpact_goto_table));
+
+                    struct ofpact_goto_table *gtb = ofpact_put_GOTO_TABLE(&ofpacts);
+                    gtb->table_id = 1;
+                    // ofpact_put_OUTPUT(&ofpacts)->port = OFPP_NORMAL;
+                    
+                    packet = translate_seq_number(*buffer, wlist_check);
+                    flow_extract(&packet,&new_flow);
+                    new_flow.in_port.ofp_port = OFPP_NONE;
+                    
+                    ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow,NULL,ofpacts.data,ofpacts.size,&packet);
+                        
+                    // dp_packet_delete(packet);
+                    ofpbuf_uninit(&ofpacts);
+                    goto free_packet;
+                } 
+
+                struct tcp_header *tcp = dp_packet_l4(buffer);
+                uint32_t syncookie = ntohl(get_16aligned_be32(&tcp->tcp_ack)) - 1; // cookie = ack number cua goi ack - 1
+                uint32_t sseq = ntohl(get_16aligned_be32(&tcp->tcp_seq)) - 1; // sequence number cua goi syn 
+                
+                if(check_tcp_syn_cookie(syncookie,ntohl(tflow.nw_src),ntohl(tflow.nw_dst)
+                                    ,ntohs(tflow.tp_src), ntohs(tflow.tp_dst),sseq) != syncookie_secret[1]) 
+                {
+                    goto free_packet;
+                }
+
+                struct ofpbuf ofpacts; 
+                struct dp_packet* npacket;
+                struct flow new_flow;
+
+                wlist.arr[wlist.current_number_element].client.ip = tflow.nw_src;
+                wlist.arr[wlist.current_number_element].client.tcp = tflow.tp_src;
+                wlist.arr[wlist.current_number_element].server.ip = tflow.nw_dst;
+                wlist.arr[wlist.current_number_element].server.tcp = tflow.tp_dst;
+                wlist.arr[wlist.current_number_element].cookie = syncookie;
+                wlist.arr[wlist.current_number_element].translate_status.delta = 0;
+                wlist.arr[wlist.current_number_element].translate_status.translated = false;
+                // wlist.arr[wlist.current_number_element].translate_status.second_syn_ack = false;
+                wlist.current_number_element += 1;
+
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_goto_table));
+                // ofpact_put_OUTPUT(&ofpacts)->port = OFPP_NORMAL; // chuyen goi ra port ung voi server
+                struct ofpact_goto_table *gtb = ofpact_put_GOTO_TABLE(&ofpacts);
+                gtb->table_id = 1;
+                //tao goi syn
+                npacket = packet_compose(*buffer,tflow.tcp_flags,true,0);
+               
+                flow_extract(npacket,&new_flow);
+                new_flow.in_port.ofp_port = OFPP_NONE;
+    
+                ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow,NULL,ofpacts.data,ofpacts.size,npacket);
+                ofpbuf_uninit(&ofpacts);
+                dp_packet_delete(npacket);
+                goto free_packet;
+            } 
+
+            if (ntohs(tflow.tcp_flags) == (TCP_SYN|TCP_ACK)) 
+            {            
+                struct wlist_check_ret wlist_check = check_white_list(tflow.nw_src,tflow.tp_src,tflow.nw_dst,tflow.tp_dst);
+               if (wlist_check.idx == -1) 
+               {
+                goto free_packet;
+               }
+                struct flow new_flow1;
+                struct tcp_header *tcp = dp_packet_l4(buffer);
+                uint32_t sseq = ntohl(get_16aligned_be32(&tcp->tcp_seq));
+                struct ofpbuf ofpacts;
+                struct dp_packet* npacket;
+
+                wlist.arr[wlist_check.idx].translate_status.translated = true; // bat dau cho phep doi seq/ack seq number
+                wlist.arr[wlist_check.idx].translate_status.delta = sseq - wlist.arr[wlist_check.idx].cookie; 
+
+                
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_goto_table));
+                // ofpact_put_OUTPUT(&ofpacts)->port = OFPP_NORMAL; // chuyen goi ra port ung voi server
+                struct ofpact_goto_table *gtb = ofpact_put_GOTO_TABLE(&ofpacts);
+                gtb->table_id = 1;
+
+                npacket = packet_compose(*buffer,tflow.tcp_flags,false,wlist.arr[wlist_check.idx].cookie);
+                flow_extract(npacket,&new_flow1);
+                new_flow1.in_port.ofp_port = OFPP_NONE;
+                ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow1,NULL,ofpacts.data,ofpacts.size,npacket);
+
+
+                // mpacket = packet_compose(*buffer,tflow.tcp_flags,true,wlist.arr[wlist_check].cookie);
+                // flow_extract(mpacket,&new_flow2);
+                // new_flow2.in_port.ofp_port = OFPP_NONE;
+                // ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow2,NULL,ofpacts.data,ofpacts.size,mpacket);
+
+                ofpbuf_uninit(&ofpacts);
+                dp_packet_delete(npacket);
+                // dp_packet_delete(mpacket);
+                goto free_packet;
+            } 
+
+            if ( (ntohs(tflow.tcp_flags) == (TCP_ACK|TCP_PSH))) { 
+                struct wlist_check_ret wlist_check = check_white_list(tflow.nw_src,tflow.tp_src,tflow.nw_dst,tflow.tp_dst);
+                if (wlist_check.idx == -1) 
+                {
+                    goto free_packet;
+                }
+
+                if (wlist.arr[wlist_check.idx].translate_status.translated != true) 
+                {
+                    goto free_packet;
+                }
+
+                //                 FILE *log = fopen("/home/security/AVANT.txt", "a");
+                // fprintf(log, "PSH ne   : %x %d \n", tflow.nw_src, wlist_check.direct);
+                // fclose(log);
+                struct ofpbuf ofpacts;
+                struct flow new_flow;
+                struct dp_packet packet;
+
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_output));
+                
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_goto_table));
+                // ofpact_put_OUTPUT(&ofpacts)->port = OFPP_NORMAL; // chuyen goi ra port ung voi server
+                struct ofpact_goto_table *gtb = ofpact_put_GOTO_TABLE(&ofpacts);
+                gtb->table_id = 1;
+
+                packet = translate_seq_number(*buffer, wlist_check);
+                flow_extract(&packet,&new_flow);
+                new_flow.in_port.ofp_port = OFPP_NONE;
+                ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow,NULL,ofpacts.data,ofpacts.size,&packet);
+                ofpbuf_uninit(&ofpacts);
+                goto free_packet;
+            } 
+
+            if (ntohs(tflow.tcp_flags) & (TCP_FIN|TCP_RST)) 
+            {
+                struct wlist_check_ret wlist_check = check_white_list(tflow.nw_src,tflow.tp_src,tflow.nw_dst,tflow.tp_dst);
+                if (wlist_check.idx == -1) {
+                    goto free_packet;
+                }
+
+                if (wlist.arr[wlist_check.idx].translate_status.translated != true) {
+                    goto free_packet;
+                }
+
+
+                struct ofpbuf ofpacts; // buffer
+                struct flow new_flow;
+                struct dp_packet packet;
+
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_output));
+
+                ofpbuf_init(&ofpacts, sizeof(struct ofpact_goto_table));
+                // ofpact_put_OUTPUT(&ofpacts)->port = OFPP_NORMAL; // chuyen goi ra port ung voi server
+                struct ofpact_goto_table *gtb = ofpact_put_GOTO_TABLE(&ofpacts);
+                gtb->table_id = 1;
+
+                packet = translate_seq_number(*buffer, wlist_check);
+                flow_extract(&packet,&new_flow);
+                new_flow.in_port.ofp_port = OFPP_NONE;
+                ofproto_dpif_execute_actions(ofproto,OVS_VERSION_MAX,&new_flow,NULL,ofpacts.data,ofpacts.size,&packet);
+                ofpbuf_uninit(&ofpacts);
+                goto free_packet;
+            }
+normal_handle:
             connmgr_send_async_msg(ofproto->up.connmgr, am);
+            // ofproto_async_msg_free(am);
+free_packet:
             ofproto_async_msg_free(am);
+            dp_packet_delete(buffer);
         }
     }
+
 
     if (ofproto->netflow) {
         netflow_run(ofproto->netflow);
@@ -2339,7 +2882,6 @@ set_ipfix(
     struct dpif_ipfix *di = ofproto->ipfix;
     bool has_options = bridge_exporter_options || flow_exporters_options;
     bool new_di = false;
-    bool options_changed = false;
 
     if (has_options && !di) {
         di = ofproto->ipfix = dpif_ipfix_create();
@@ -2349,7 +2891,7 @@ set_ipfix(
     if (di) {
         /* Call set_options in any case to cleanly flush the flow
          * caches in the last exporters that are to be destroyed. */
-        options_changed = dpif_ipfix_set_options(
+        dpif_ipfix_set_options(
             di, bridge_exporter_options, flow_exporters_options,
             n_flow_exporters_options);
 
@@ -2366,7 +2908,9 @@ set_ipfix(
             ofproto->ipfix = NULL;
         }
 
-        if (new_di || options_changed) {
+        /* TODO: need to consider ipfix option changes more than
+         * enable/disable */
+        if (new_di || !ofproto->ipfix) {
             ofproto->backer->need_revalidate = REV_RECONFIGURE;
         }
     }
@@ -2491,11 +3035,11 @@ set_lldp(struct ofport *ofport_,
 {
     struct ofport_dpif *ofport = ofport_dpif_cast(ofport_);
     struct ofproto_dpif *ofproto = ofproto_dpif_cast(ofport->up.ofproto);
-    bool old_enable = lldp_is_enabled(ofport->lldp);
     int error = 0;
 
-    if (cfg && !smap_is_empty(cfg)) {
+    if (cfg) {
         if (!ofport->lldp) {
+            ofproto->backer->need_revalidate = REV_RECONFIGURE;
             ofport->lldp = lldp_create(ofport->up.netdev, ofport_->mtu, cfg);
         }
 
@@ -2507,9 +3051,6 @@ set_lldp(struct ofport *ofport_,
     } else if (ofport->lldp) {
         lldp_unref(ofport->lldp);
         ofport->lldp = NULL;
-    }
-
-    if (lldp_is_enabled(ofport->lldp) != old_enable) {
         ofproto->backer->need_revalidate = REV_RECONFIGURE;
     }
 
@@ -5601,7 +6142,6 @@ ct_set_zone_timeout_policy(const char *datapath_type, uint16_t zone_id,
             ct_timeout_policy_unref(backer, ct_zone->ct_tp);
             ct_zone->ct_tp = ct_tp;
             ct_tp->ref_count++;
-            backer->need_revalidate = REV_RECONFIGURE;
         }
     } else {
         struct ct_zone *new_ct_zone = ct_zone_alloc(zone_id);
@@ -5609,7 +6149,6 @@ ct_set_zone_timeout_policy(const char *datapath_type, uint16_t zone_id,
         cmap_insert(&backer->ct_zones, &new_ct_zone->node,
                     hash_int(zone_id, 0));
         ct_tp->ref_count++;
-        backer->need_revalidate = REV_RECONFIGURE;
     }
 }
 
@@ -5626,7 +6165,6 @@ ct_del_zone_timeout_policy(const char *datapath_type, uint16_t zone_id)
     if (ct_zone) {
         ct_timeout_policy_unref(backer, ct_zone->ct_tp);
         ct_zone_remove_and_destroy(backer, ct_zone);
-        backer->need_revalidate = REV_RECONFIGURE;
     }
 }
 
